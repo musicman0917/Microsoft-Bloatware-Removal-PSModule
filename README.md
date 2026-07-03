@@ -1,1 +1,1 @@
-# Mivcrosoft-Bloatware-Removal-PSModule
+# Microsoft-Bloatware-Removal-PSModule
