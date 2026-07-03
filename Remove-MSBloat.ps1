@@ -11,6 +11,9 @@
     This is a plain PowerShell script - no installation or module import is
     required. Just download and run it, or use the one-liner below.
 
+    Prefer a graphical interface with individual app/tweak checkboxes? See
+    Remove-MSBloat-GUI.ps1 in the same repo.
+
 .PARAMETER KeepXbox
     Leaves the Xbox app, Game Bar, and related overlay apps installed.
 
@@ -53,6 +56,35 @@ param(
     [switch]$Force
 )
 
+$ScriptVersion = '1.0.0'
+
+# --- CORE LOADER ---
+# Loads MSBloat.Core.ps1 from disk if it sits next to this script (repo clone /
+# release zip), otherwise fetches it from GitHub pinned to this script's own
+# release tag, so a single downloaded file (or "irm | iex") still works.
+$coreLoaded = $false
+if ($PSScriptRoot) {
+    $localCore = Join-Path $PSScriptRoot 'MSBloat.Core.ps1'
+    if (Test-Path -LiteralPath $localCore) {
+        . $localCore
+        $coreLoaded = $true
+    }
+}
+if (-not $coreLoaded) {
+    try {
+        $coreUri = "https://raw.githubusercontent.com/musicman0917/Microsoft-Bloatware-Removal-PSModule/v$ScriptVersion/MSBloat.Core.ps1"
+        $coreText = Invoke-RestMethod -Uri $coreUri -TimeoutSec 10 -ErrorAction Stop
+        . ([scriptblock]::Create($coreText))
+        $coreLoaded = $true
+    } catch {
+        Write-Warning "Could not load MSBloat.Core.ps1: $($_.Exception.Message)"
+    }
+}
+if (-not $coreLoaded) {
+    throw "Fatal: core library could not be loaded. Check your internet connection."
+}
+# --- END CORE LOADER ---
+
 function Remove-MSBloat {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -62,12 +94,8 @@ function Remove-MSBloat {
     )
 
     # --- AUTO-ELEVATION LOGIC ---
-    $isAdmin = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent().IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-    if (-not $isAdmin) {
+    if (-not (Test-MSBloatIsAdmin)) {
         if (-not $PSCommandPath) {
-            # Script was piped into iex (e.g. "irm ... | iex"). There is no file on
-            # disk to relaunch, so we can't self-elevate - ask the user to do it.
             Write-Warning "Administrator privileges are required, but this script was run from a pipe (e.g. 'irm | iex')."
             Write-Warning "Open PowerShell 'as Administrator' and run the command again."
             return
@@ -75,17 +103,14 @@ function Remove-MSBloat {
 
         Write-Host "Administrator privileges are required. Prompting for User Account Control (UAC) elevation..." -ForegroundColor Yellow
 
-        $relaunchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+        $relaunchArgs = @()
         if ($KeepXbox) { $relaunchArgs += '-KeepXbox' }
         if ($SkipRestorePoint) { $relaunchArgs += '-SkipRestorePoint' }
         if ($Force) { $relaunchArgs += '-Force' }
         if ($WhatIfPreference) { $relaunchArgs += '-WhatIf' }
 
-        # Determine if running in Windows PowerShell (v5) or PowerShell Core (v6+)
-        $psExe = if ($PSVersionTable.PSVersion.Major -ge 6) { "pwsh.exe" } else { "powershell.exe" }
-
         try {
-            Start-Process -FilePath $psExe -ArgumentList $relaunchArgs -Verb RunAs
+            Start-MSBloatElevation -ScriptPath $PSCommandPath -ArgumentList $relaunchArgs
             return # Stop executing in the current non-admin window
         } catch {
             Write-Warning "Elevation cancelled. You must grant Administrator permissions to run this script."
@@ -94,40 +119,16 @@ function Remove-MSBloat {
     }
     # --- END AUTO-ELEVATION LOGIC ---
 
-    $bloatApps = @(
-        "Clipchamp.Clipchamp",
-        "Microsoft.BingNews",
-        "Microsoft.BingWeather",
-        "Microsoft.Todos",
-        "Microsoft.MicrosoftSolitaireCollection",
-        "Microsoft.YourPhone",
-        "Microsoft.ZuneMusic",
-        "Microsoft.ZuneVideo"
-    )
-
-    if (-not $KeepXbox) {
-        $bloatApps += @(
-            "Microsoft.GamingApp",
-            "Microsoft.XboxGamingOverlay",
-            "Microsoft.XboxApp",
-            "Microsoft.Xbox.TCUI",
-            "Microsoft.XboxSpeechToTextOverlay"
-        )
-    }
-
-    $registryTweaks = @(
-        @{ Name = "Copilot Disabled"; Path = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"; Key = "TurnOffWindowsCopilot"; Value = 1; Type = "DWord" },
-        @{ Name = "Taskbar Widgets Disabled"; Path = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"; Key = "AllowNewsAndInterests"; Value = 0; Type = "DWord" },
-        @{ Name = "Sponsored Start Menu Pins Disabled"; Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"; Key = "DisableWindowsConsumerFeatures"; Value = 1; Type = "DWord" },
-        @{ Name = "Start Menu Web Search Disabled"; Path = "HKCU:\Software\Policies\Microsoft\Windows\Explorer"; Key = "DisableSearchBoxSuggestions"; Value = 1; Type = "DWord" }
-    )
+    $appIds = $script:MSBloatAppCatalog |
+        Where-Object { -not ($KeepXbox -and $_.Category -eq 'Xbox') } |
+        Select-Object -ExpandProperty Id
+    $tweakIds = $script:MSBloatTweakCatalog | Select-Object -ExpandProperty Id
 
     # --- CONFIRMATION ---
     if (-not $Force -and -not $WhatIfPreference) {
         Write-Host "`nThis script will:" -ForegroundColor Yellow
-        Write-Host " - Remove up to $($bloatApps.Count) inbox apps (if installed)" -ForegroundColor Yellow
-        Write-Host " - Apply $($registryTweaks.Count) registry tweaks (Copilot, Widgets, Start menu ads/search)" -ForegroundColor Yellow
-        Write-Host " - Disable OneDrive auto-startup" -ForegroundColor Yellow
+        Write-Host " - Remove up to $($appIds.Count) inbox apps (if installed)" -ForegroundColor Yellow
+        Write-Host " - Apply $($tweakIds.Count) registry tweaks (Copilot, Widgets, Start menu ads/search, OneDrive)" -ForegroundColor Yellow
         if (-not $SkipRestorePoint) {
             Write-Host " - Create a System Restore Point first" -ForegroundColor Yellow
         }
@@ -138,93 +139,11 @@ function Remove-MSBloat {
         }
     }
 
-    # --- SYSTEM RESTORE POINT ---
-    if (-not $SkipRestorePoint) {
-        if ($PSCmdlet.ShouldProcess("System", "Create System Restore Point")) {
-            Write-Host "Creating a System Restore Point..." -ForegroundColor Cyan
-            try {
-                Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
-                Checkpoint-Computer -Description "Pre-MSBloat-Removal" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-                Write-Host "Restore point created." -ForegroundColor Green
-            } catch {
-                Write-Warning "Could not create a System Restore Point: $($_.Exception.Message)"
-                Write-Warning "Continuing without one. Use -SkipRestorePoint to suppress this attempt."
-            }
-        }
-    }
+    $cliLog = { param($evt) Write-Host $evt.Message -ForegroundColor $evt.Color }
 
-    $removedApps = @()
-    $failedApps = @()
-    $appliedTweaks = @()
-    $failedTweaks = @()
-
-    Write-Host "`nScanning for and removing bloatware apps..." -ForegroundColor Cyan
-
-    foreach ($app in $bloatApps) {
-        if (-not $PSCmdlet.ShouldProcess($app, "Remove application")) { continue }
-
-        $attempted = $false
-        $errorMsg = $null
-
-        # Check and remove for current user
-        $installedApp = Get-AppxPackage -Name "*$app*" -AllUsers -ErrorAction SilentlyContinue
-        if ($installedApp) {
-            $attempted = $true
-            try {
-                $installedApp | Remove-AppxPackage -ErrorAction Stop
-            } catch {
-                $errorMsg = $_.Exception.Message
-            }
-        }
-
-        # Check and remove from system provisioning (prevents reinstall for new users)
-        $provisionedApp = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match $app }
-        if ($provisionedApp) {
-            $attempted = $true
-            try {
-                $provisionedApp | Remove-AppxProvisionedPackage -Online -ErrorAction Stop
-            } catch {
-                $errorMsg = $_.Exception.Message
-            }
-        }
-
-        # Log the result if we actually tried to remove it
-        if ($attempted) {
-            if ($errorMsg) {
-                $failedApps += [PSCustomObject]@{ Name = $app; Reason = $errorMsg }
-            } else {
-                $removedApps += $app
-            }
-        }
-    }
-
-    Write-Host "Applying System & UI Registry Tweaks..." -ForegroundColor Cyan
-
-    foreach ($tweak in $registryTweaks) {
-        if (-not $PSCmdlet.ShouldProcess($tweak.Path, "Set $($tweak.Key) = $($tweak.Value)")) { continue }
-
-        try {
-            if (!(Test-Path $tweak.Path)) { New-Item -Path $tweak.Path -Force -ErrorAction Stop | Out-Null }
-            Set-ItemProperty -Path $tweak.Path -Name $tweak.Key -Value $tweak.Value -Type $tweak.Type -Force -ErrorAction Stop
-            $appliedTweaks += $tweak.Name
-        } catch {
-            $failedTweaks += [PSCustomObject]@{ Name = $tweak.Name; Reason = $_.Exception.Message }
-        }
-    }
-
-    # OneDrive Startup
-    $oneDriveName = "OneDrive auto-startup disabled"
-    $oneDriveRunPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    if ($PSCmdlet.ShouldProcess($oneDriveRunPath, "Remove OneDrive auto-startup entry")) {
-        try {
-            if (Get-ItemProperty -Path $oneDriveRunPath -Name "OneDrive" -ErrorAction SilentlyContinue) {
-                Remove-ItemProperty -Path $oneDriveRunPath -Name "OneDrive" -ErrorAction Stop
-            }
-            $appliedTweaks += $oneDriveName
-        } catch {
-            $failedTweaks += [PSCustomObject]@{ Name = $oneDriveName; Reason = $_.Exception.Message }
-        }
-    }
+    $result = Invoke-MSBloatRemoval -AppIds $appIds -TweakIds $tweakIds `
+        -SkipRestorePoint:$SkipRestorePoint -WhatIf:$WhatIfPreference -Confirm:$false `
+        -LogAction $cliLog
 
     if ($WhatIfPreference) { return }
 
@@ -233,38 +152,34 @@ function Remove-MSBloat {
     Write-Host "          CLEANUP RESULTS               " -ForegroundColor Magenta
     Write-Host "========================================" -ForegroundColor Magenta
 
-    # Successful Apps
-    if ($removedApps.Count -gt 0) {
-        Write-Host "Apps successfully removed ($($removedApps.Count)):" -ForegroundColor Green
-        foreach ($removed in $removedApps) { Write-Host " - $removed" -ForegroundColor DarkGray }
+    if ($result.RemovedApps.Count -gt 0) {
+        Write-Host "Apps successfully removed ($($result.RemovedApps.Count)):" -ForegroundColor Green
+        foreach ($removed in $result.RemovedApps) { Write-Host " - $removed" -ForegroundColor DarkGray }
     } else {
         Write-Host "Apps removed: 0 (System was already clean)" -ForegroundColor Green
     }
 
-    # Failed Apps
-    if ($failedApps.Count -gt 0) {
-        Write-Host "`nFailed to remove apps ($($failedApps.Count)):" -ForegroundColor Red
-        foreach ($failed in $failedApps) {
+    if ($result.FailedApps.Count -gt 0) {
+        Write-Host "`nFailed to remove apps ($($result.FailedApps.Count)):" -ForegroundColor Red
+        foreach ($failed in $result.FailedApps) {
             Write-Host " - $($failed.Name)" -ForegroundColor Red
             Write-Host "   Reason: $($failed.Reason)" -ForegroundColor DarkGray
         }
     }
 
-    # Successful Tweaks
-    Write-Host "`nSystem UI Tweaks Applied ($($appliedTweaks.Count)):" -ForegroundColor Green
-    foreach ($tweak in $appliedTweaks) { Write-Host " - $tweak" -ForegroundColor DarkGray }
+    Write-Host "`nSystem UI Tweaks Applied ($($result.AppliedTweaks.Count)):" -ForegroundColor Green
+    foreach ($tweak in $result.AppliedTweaks) { Write-Host " - $tweak" -ForegroundColor DarkGray }
 
-    # Failed Tweaks
-    if ($failedTweaks.Count -gt 0) {
-        Write-Host "`nFailed to apply tweaks ($($failedTweaks.Count)):" -ForegroundColor Red
-        foreach ($failed in $failedTweaks) {
+    if ($result.FailedTweaks.Count -gt 0) {
+        Write-Host "`nFailed to apply tweaks ($($result.FailedTweaks.Count)):" -ForegroundColor Red
+        foreach ($failed in $result.FailedTweaks) {
             Write-Host " - $($failed.Name)" -ForegroundColor Red
             Write-Host "   Reason: $($failed.Reason)" -ForegroundColor DarkGray
         }
     }
 
     Write-Host "========================================" -ForegroundColor Magenta
-    if ($failedApps.Count -gt 0 -or $failedTweaks.Count -gt 0) {
+    if ($result.FailedApps.Count -gt 0 -or $result.FailedTweaks.Count -gt 0) {
         Write-Host "Process complete with some errors. Restart your computer to apply the successful changes." -ForegroundColor Yellow
     } else {
         Write-Host "Process complete! Restart your computer for registry changes to take effect." -ForegroundColor Cyan
